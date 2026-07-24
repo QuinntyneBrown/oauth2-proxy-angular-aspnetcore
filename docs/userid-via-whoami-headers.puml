@@ -1,0 +1,71 @@
+@startuml userid-via-whoami-headers
+title Kubernetes + oauth2-proxy + Okta\nAngular SPA gets the userId from X-Auth-Request-* headers on a static whoami.txt
+
+skinparam shadowing false
+skinparam sequenceMessageAlign center
+
+actor User
+participant "Browser\n(Angular SPA)" as B
+box "Kubernetes cluster" #F7F7F7
+    participant "Ingress\n(routes app.example.com\nto oauth2-proxy Service)" as I
+    participant "oauth2-proxy\nDeployment/Service\n(--set-xauthrequest=true)" as P
+    participant "Angular assets\nnginx Deployment/Service\n(incl. /assets/whoami.txt)" as S
+end box
+participant "Okta\n(OIDC provider)" as O
+
+== Unauthenticated request: standard OIDC authorization-code sign-in ==
+
+User -> B: Open https://app.example.com
+B -> I: GET / (no session cookie)
+I -> P: Forward
+P --> B: 302 Location: https://{okta-domain}/oauth2/default/v1/authorize?...
+B -> O: GET /authorize, user signs in\n(credentials, MFA, ...)
+O --> B: 302 Location: https://app.example.com/oauth2/callback?code=...&state=...
+B -> I: GET /oauth2/callback?code=...
+I -> P: Forward
+P -> O: POST /token (exchange authorization code)
+O --> P: ID token (sub, email, preferred_username claims)
+P --> B: Set-Cookie: _oauth2_proxy=<encrypted session>\n(HttpOnly, Secure) + 302 to original URL
+note over B, P
+  The browser now holds only the encrypted session cookie.
+  No token is ever stored in - or visible to - JavaScript.
+end note
+
+== Angular app loads ==
+
+B -> I: GET / \nCookie: _oauth2_proxy=...
+I -> P: Forward
+P -> P: Decrypt/validate session cookie
+P -> S: GET /index.html
+S --> P: 200 index.html + JS bundles
+P --> B: 200 - Angular app boots
+
+== SPA startup: fetch userId via whoami.txt ==
+
+B -> B: IdentityService: HttpClient GET\n/assets/whoami.txt (observe: 'response')
+B -> I: GET /assets/whoami.txt\nCookie: _oauth2_proxy=...
+I -> P: Forward
+P -> P: Decrypt cookie, load session claims\n(cached from the Okta ID token)
+P -> S: GET /assets/whoami.txt
+S --> P: 200 OK (empty/one-line body)
+P --> B: 200 OK\nX-Auth-Request-User: <sub or email>\nX-Auth-Request-Email: <email>\nX-Auth-Request-Preferred-Username: <preferred_username>
+note right of B
+  Same-origin request, so JavaScript
+  may read all response headers -
+  no CORS configuration needed.
+end note
+B -> B: userId = response.headers\n.get('X-Auth-Request-User')
+
+note over B, S
+  All standard building blocks: a stock Kubernetes Ingress, a stock oauth2-proxy
+  deployment in reverse-proxy (upstream) mode with --set-xauthrequest=true, and
+  Okta's standard authorization-code flow. API calls follow the same path: the
+  proxy swaps the cookie for "Authorization: Bearer <id-token>" toward the
+  .NET API Service (--pass-authorization-header=true).
+
+  Caching caveat: the headers come from oauth2-proxy, not the file. Serve
+  whoami.txt with Cache-Control: no-store (or cache-bust the URL) so the
+  request always reaches the proxy.
+end note
+
+@enduml

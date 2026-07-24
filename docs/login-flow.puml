@@ -1,0 +1,38 @@
+@startuml login-flow
+title Kubernetes + oauth2-proxy + Okta\nLogin and session-cookie flow (standard OIDC authorization-code)
+
+skinparam shadowing false
+skinparam sequenceMessageAlign center
+
+actor User
+participant "Browser" as B
+box "Kubernetes cluster" #F7F7F7
+    participant "Ingress\n(routes app.example.com\nto oauth2-proxy Service)" as I
+    participant "oauth2-proxy\nDeployment/Service" as P
+end box
+participant "Okta\n(OIDC provider)" as O
+
+User -> B: Open https://app.example.com
+B -> I: GET / (no session cookie)
+I -> P: Forward
+P --> B: 302 Location: https://{okta-domain}/oauth2/default/v1/authorize?...
+B -> O: GET /authorize, user signs in\n(credentials, MFA, ...)
+O --> B: 302 Location: https://app.example.com/oauth2/callback?code=...&state=...
+B -> I: GET /oauth2/callback?code=...
+I -> P: Forward
+P -> O: POST /token (exchange authorization code)
+O --> P: ID token (+ refresh token)
+note right of P
+  oauth2-proxy stores the ID token and its
+  claims (sub, email, preferred_username)
+  in the session
+end note
+P --> B: Set-Cookie: _oauth2_proxy=<encrypted session>\n(HttpOnly, Secure) + 302 to original URL
+
+note over B, P
+  All subsequent requests carry only the encrypted session cookie.
+  It is HttpOnly, so it is invisible to the Angular application -
+  no token is ever stored in, or visible to, JavaScript.
+end note
+
+@enduml

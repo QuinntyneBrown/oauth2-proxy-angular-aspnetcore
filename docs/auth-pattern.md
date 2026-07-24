@@ -1,8 +1,11 @@
 # Auth Pattern: oauth2-proxy + Okta with an Angular SPA and ASP.NET Core API
 
 This document describes an authentication pattern in which an Angular single-page
-application and an ASP.NET Core API sit behind [oauth2-proxy](https://oauth2-proxy.github.io/oauth2-proxy/),
-with **Okta** as the OIDC identity provider.
+application and an ASP.NET Core API run in **Kubernetes** behind
+[oauth2-proxy](https://oauth2-proxy.github.io/oauth2-proxy/), with **Okta** as the OIDC
+identity provider. Every building block is stock: a standard Kubernetes Ingress, a
+standard oauth2-proxy deployment in reverse-proxy (upstream) mode, and Okta's standard
+authorization-code flow — nothing is custom to this implementation.
 
 The defining properties of the pattern:
 
@@ -20,49 +23,42 @@ The defining properties of the pattern:
 | Actor | Role |
 |---|---|
 | Browser (Angular SPA) | Sends the session cookie on every request; never handles tokens |
-| oauth2-proxy | Terminates authentication; owns the cookie ↔ token exchange |
+| Kubernetes Ingress | Routes all `app.example.com` traffic to the oauth2-proxy Service |
+| oauth2-proxy (Deployment/Service) | Terminates authentication; owns the cookie ↔ token exchange |
 | Okta | OIDC provider; runs the login flow and issues the ID token with the user's claims |
-| ASP.NET Core API | Upstream; validates the Bearer token it receives from the proxy |
-| Static assets | The built Angular app, including a static `whoami.txt` used for identity discovery |
+| ASP.NET Core API (Deployment/Service) | Upstream; validates the Bearer token it receives from the proxy |
+| Angular assets (nginx Deployment/Service) | Serves the built Angular app, including a static `whoami.txt` used for identity discovery |
 
 ## Architecture
 
 ```mermaid
 flowchart LR
-    B[Browser<br/>Angular SPA] -- "session cookie only" --> P[oauth2-proxy]
-    P -- "static assets" --> S[Angular static files<br/>incl. /assets/whoami.txt]
-    P -- "Authorization: Bearer &lt;id-token&gt;" --> A[ASP.NET Core API]
+    B[Browser<br/>Angular SPA] -- "session cookie only" --> I[Ingress]
+    subgraph K8s [Kubernetes cluster]
+        I --> P[oauth2-proxy<br/>Deployment/Service]
+        P -- "static assets" --> S[Angular assets<br/>nginx Deployment/Service<br/>incl. /assets/whoami.txt]
+        P -- "Authorization: Bearer &lt;id-token&gt;" --> A[ASP.NET Core API<br/>Deployment/Service]
+    end
     P <-. "OIDC authorization-code flow" .-> O[(Okta)]
 ```
 
-Everything the browser talks to goes through oauth2-proxy. The proxy serves (or
-forwards to) the Angular static assets and proxies API calls to the ASP.NET Core
-backend. Okta is only involved during login and token refresh — it never sees the
-day-to-day traffic.
+Everything the browser talks to enters through the Ingress, which routes all traffic
+for the host to the oauth2-proxy Service. oauth2-proxy runs in its standard
+reverse-proxy (upstream) mode, forwarding to the Angular assets Service and the
+ASP.NET Core API Service. Okta is only involved during login and token refresh — it
+never sees the day-to-day traffic.
 
 ## Login and cookie flow
 
-An unauthenticated request to any proxied path triggers the standard OIDC
-authorization-code flow. Once it completes, oauth2-proxy stores the session (including
-the Okta ID token) server-side or encrypted in the cookie, and the browser carries only
-the `_oauth2_proxy` cookie from then on.
+An unauthenticated request to any path triggers the standard OIDC authorization-code
+flow: the Ingress forwards the request to oauth2-proxy, which redirects the browser to
+Okta to sign in. Once the flow completes, oauth2-proxy stores the session (including
+the Okta ID token) encrypted, and the browser carries only the encrypted
+`_oauth2_proxy` cookie from then on.
 
-```mermaid
-sequenceDiagram
-    participant B as Browser
-    participant P as oauth2-proxy
-    participant O as Okta
+![Login and session-cookie flow](./login-flow.png)
 
-    B->>P: GET / (no session cookie)
-    P->>B: 302 redirect to Okta /authorize
-    B->>O: Login (credentials, MFA, ...)
-    O->>B: 302 redirect to /oauth2/callback?code=...
-    B->>P: GET /oauth2/callback?code=...
-    P->>O: Exchange code for tokens
-    O->>P: ID token (+ refresh token)
-    P->>B: Set-Cookie: _oauth2_proxy=... (HttpOnly, Secure)
-    Note over B,P: All subsequent requests carry only the cookie
-```
+*Source: [`login-flow.puml`](./login-flow.puml)*
 
 The cookie is `HttpOnly`, so it is invisible to the Angular application. From the SPA's
 point of view, authentication simply "already happened" by the time it renders.
@@ -118,9 +114,13 @@ them in the session and surfaces them as headers. The trick is that the headers 
 on *any* proxied response — so the cheapest possible request works: a static text file.
 
 1. Ship an empty (or one-line) file with the Angular build, e.g.
-   `src/assets/whoami.txt`.
-2. At startup, the Angular app fetches it through the proxy and reads the header
-   instead of the body.
+   `src/assets/whoami.txt`, served by the Angular assets nginx pod.
+2. At startup, the Angular app fetches it through the Ingress and oauth2-proxy and
+   reads the header instead of the body.
+
+![userId via whoami.txt response headers](./userid-via-whoami-headers.png)
+
+*Source: [`userid-via-whoami-headers.puml`](./userid-via-whoami-headers.puml)*
 
 ```typescript
 // identity.service.ts
@@ -194,9 +194,32 @@ oauth2-proxy
   # Identity response headers for the SPA
   --set-xauthrequest=true
 
-  # Upstreams
-  --upstream=http://localhost:5000/          # ASP.NET Core API + Angular static files
+  # Upstreams (in-cluster Service DNS names)
+  --upstream=http://api.default.svc.cluster.local/api/            # ASP.NET Core API Service
+  --upstream=http://angular-assets.default.svc.cluster.local/     # Angular assets nginx Service
   --http-address=0.0.0.0:4180
+```
+
+In Kubernetes, oauth2-proxy runs as an ordinary Deployment with a Service, and a
+standard Ingress routes all traffic for the host to that Service:
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: app
+spec:
+  rules:
+    - host: app.example.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: oauth2-proxy
+                port:
+                  number: 4180
 ```
 
 In Okta, this corresponds to a standard **Web** application (authorization-code grant)
