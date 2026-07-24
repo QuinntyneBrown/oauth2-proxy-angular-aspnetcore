@@ -17,6 +17,9 @@ The defining properties of the pattern:
 - **The SPA gets the current userId without a backend API.** The Angular app fetches a
   static `.txt` file through the proxy and reads identity response headers that
   oauth2-proxy attaches. No .NET endpoint is required for this.
+- **Real-time works the same way.** A SignalR hub is secured by the same exchange: the
+  cookie rides along on the WebSocket handshake and the proxy turns it into a bearer
+  token, so no `?access_token=` query-string workaround is needed.
 
 ## Actors
 
@@ -26,7 +29,7 @@ The defining properties of the pattern:
 | Kubernetes Ingress | Routes all `app.example.com` traffic to the oauth2-proxy Service |
 | oauth2-proxy (Deployment/Service) | Terminates authentication; owns the cookie ↔ token exchange |
 | Okta | OIDC provider; runs the login flow and issues the ID token with the user's claims |
-| ASP.NET Core API (Deployment/Service) | Upstream; validates the Bearer token it receives from the proxy |
+| ASP.NET Core API (Deployment/Service) | Upstream; validates the Bearer token it receives from the proxy, including on SignalR hub connections |
 | Angular assets (nginx Deployment/Service) | Serves the built Angular app, including a static `whoami.txt` used for identity discovery |
 
 ## Architecture
@@ -161,6 +164,125 @@ static-file caching caveat. This document standardizes on the static-file + resp
 header approach as the primary pattern, but `/oauth2/userinfo` is a drop-in alternative
 if a JSON payload is preferred.
 
+## Securing a SignalR Hub
+
+Real-time features fit this pattern with no extra authentication machinery. The usual
+pain point of securing a SignalR hub with JWTs — the browser's WebSocket API cannot set
+an `Authorization` header, forcing the `?access_token=` query-string workaround and a
+`JwtBearerEvents.OnMessageReceived` handler on the server — simply does not arise here.
+The browser attaches the session cookie to the WebSocket handshake automatically because
+it is a same-origin request, and oauth2-proxy performs the same Cookie → Token exchange
+on that handshake that it performs on any other proxied request.
+
+A SignalR connection is established in two steps, and both go through the proxy:
+
+1. **Negotiate** — an ordinary `POST /api/hubs/notifications/negotiate`. The proxy
+   injects `Authorization: Bearer <okta-id-token>`; the API returns the connection id and
+   the available transports.
+2. **WebSocket upgrade** — `GET /api/hubs/notifications?id=...` with `Upgrade: websocket`.
+   oauth2-proxy proxies WebSockets by default (`--proxy-websockets=true`), preserving the
+   upgrade headers and injecting the same bearer token before the request reaches the API.
+
+![Securing a SignalR Hub](./signalr-hub-flow.png)
+
+*Source: [`signalr-hub-flow.puml`](./signalr-hub-flow.puml)*
+
+### Server side
+
+The hub is a plain `[Authorize]` hub validated by the same `AddJwtBearer` configuration
+the rest of the API uses. There is nothing oauth2-proxy-specific in it:
+
+```csharp
+// Program.cs
+builder.Services.AddSignalR();
+
+app.MapHub<NotificationsHub>("/api/hubs/notifications", options =>
+{
+    // .NET 7+: close the connection when the bearer token expires instead of
+    // letting an authenticated socket outlive the token that authorized it.
+    options.CloseOnAuthenticationExpiration = true;
+});
+```
+
+```csharp
+[Authorize]
+public class NotificationsHub : Hub
+{
+    public override async Task OnConnectedAsync()
+    {
+        // Same claims the API sees on any request - they come from the Okta ID token.
+        var userId = Context.UserIdentifier;                  // "sub" by default
+        var email  = Context.User?.FindFirst("email")?.Value;
+
+        await Groups.AddToGroupAsync(Context.ConnectionId, $"user:{userId}");
+        await base.OnConnectedAsync();
+    }
+}
+```
+
+`Context.UserIdentifier` comes from SignalR's default `IUserIdProvider`, which reads
+`ClaimTypes.NameIdentifier` — the claim `JwtBearer` maps `sub` onto. If the API sets
+`options.MapInboundClaims = false` (keeping raw claim names), supply a custom
+`IUserIdProvider` that reads `"sub"` directly, otherwise `Clients.User(userId)` silently
+addresses nobody. Using the same identifier the SPA reads from `X-Auth-Request-User`
+keeps client and server talking about the same user.
+
+### Client side
+
+The Angular client is the default configuration — no accessTokenFactory, no headers:
+
+```typescript
+// notifications.service.ts
+import { Injectable } from '@angular/core';
+import { HubConnection, HubConnectionBuilder } from '@microsoft/signalr';
+
+@Injectable({ providedIn: 'root' })
+export class NotificationsService {
+  private readonly connection: HubConnection = new HubConnectionBuilder()
+    .withUrl('/api/hubs/notifications')   // same origin -> cookie is sent automatically
+    .withAutomaticReconnect()
+    .build();
+
+  start(): Promise<void> {
+    this.connection.on('notify', payload => { /* ... */ });
+    return this.connection.start();
+  }
+}
+```
+
+The URL must be **relative** (same origin as the SPA) so the request flows through the
+Ingress and the proxy and the cookie is attached. Do **not** set `skipNegotiation: true`:
+skipping negotiate forces the WebSocket transport and removes the HTTP request that makes
+proxy behaviour easiest to reason about, and it breaks sticky-session routing when the API
+is scaled to more than one pod.
+
+### Deployment details that matter
+
+- **WebSocket support in the Ingress.** oauth2-proxy handles upgrades itself, but the
+  Ingress controller must not close idle connections. With ingress-nginx:
+
+  ```yaml
+  metadata:
+    annotations:
+      nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+      nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
+  ```
+
+- **Token lifetime vs. connection lifetime.** Authentication is checked at handshake
+  time only; once upgraded, frames are not re-authenticated. With
+  `CloseOnAuthenticationExpiration = true` the server closes the socket when the bearer
+  token expires, and `.withAutomaticReconnect()` re-runs negotiate — which gives
+  oauth2-proxy the chance to refresh the token. Keep `--cookie-refresh` shorter than the
+  Okta ID-token lifetime so the session is renewed before it lapses.
+- **Reconnect after the session itself expires.** If the oauth2-proxy session is gone,
+  negotiate is answered with a `302` to Okta. An XHR or WebSocket cannot complete an
+  interactive redirect, so the reconnect fails. Handle
+  `connection.onclose(...)` by reloading the page (`window.location.reload()`), which
+  lets the browser follow the redirect and sign in again.
+- **Scale-out.** More than one API pod requires the usual SignalR arrangements — a Redis
+  backplane and sticky sessions (`nginx.ingress.kubernetes.io/affinity: cookie`) — since
+  negotiate and the subsequent upgrade must reach the same pod.
+
 ## Full example configuration
 
 A consolidated oauth2-proxy configuration for this pattern with Okta:
@@ -186,6 +308,9 @@ oauth2-proxy
 
   # Identity response headers for the SPA
   --set-xauthrequest=true
+
+  # WebSocket upgrades (SignalR) - enabled by default, shown for clarity
+  --proxy-websockets=true
 
   # Upstreams (in-cluster Service DNS names)
   --upstream=http://api.default.svc.cluster.local/api/            # ASP.NET Core API Service
@@ -230,6 +355,11 @@ whose sign-in redirect URI is `https://app.example.com/oauth2/callback`. The `su
   should blindly rely on. `AddJwtBearer` validation (issuer, audience, signature,
   expiry against the Okta authority) must remain enabled, and the API should not be
   reachable except through the proxy.
+- **A WebSocket is authenticated once.** Unlike request/response traffic, an upgraded
+  SignalR connection is not re-checked per frame, so a revoked or expired session can
+  outlive its socket. `CloseOnAuthenticationExpiration = true` bounds that window to the
+  token's lifetime; hubs that must react to revocation faster need an explicit
+  server-side disconnect.
 - **Strip inbound identity headers.** If the deployment ever honors `X-Auth-Request-*`
   or `Authorization` from clients directly (bypassing the proxy), a client could forge
   them. Network topology should guarantee that all API traffic flows through

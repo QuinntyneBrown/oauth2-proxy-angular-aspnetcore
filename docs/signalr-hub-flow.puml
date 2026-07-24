@@ -1,0 +1,97 @@
+@startuml signalr-hub-flow
+title Kubernetes + oauth2-proxy + Okta\nSecuring a SignalR Hub (negotiate + WebSocket upgrade through the proxy)
+
+skinparam shadowing false
+skinparam sequenceMessageAlign center
+
+actor User
+participant "Browser\n(Angular SPA\n@microsoft/signalr)" as B
+box "Kubernetes cluster" #F7F7F7
+    participant "Ingress\n(routes app.example.com\nto oauth2-proxy Service)" as I
+    participant "oauth2-proxy\nDeployment/Service\n(--proxy-websockets=true)" as P
+    participant "ASP.NET Core API\nDeployment/Service\n([Authorize] NotificationsHub)" as A
+end box
+participant "Okta\n(OIDC provider)" as O
+
+note over B, P
+  Precondition: the user already signed in via the standard OIDC
+  authorization-code flow, so the browser holds only the encrypted
+  HttpOnly _oauth2_proxy cookie. JavaScript has no token.
+end note
+
+== 1. Negotiate (ordinary HTTP POST) ==
+
+User -> B: App starts the hub connection
+B -> B: new HubConnectionBuilder()\n.withUrl('/api/hubs/notifications')\n.withAutomaticReconnect().build()
+B -> I: POST /api/hubs/notifications/negotiate?negotiateVersion=1\nCookie: _oauth2_proxy=...
+I -> P: Forward
+P -> P: Decrypt/validate session cookie,\nload the stored Okta ID token
+P -> A: POST .../negotiate\nAuthorization: Bearer <okta-id-token>
+note right of P
+  Cookie -> Token pass-through
+  (--pass-authorization-header=true)
+  is transport-agnostic: it applies to
+  the negotiate call and to the
+  WebSocket handshake alike.
+end note
+A -> A: JwtBearer validates the token\n(issuer, audience, signature, expiry)\n-> [Authorize] on the Hub passes
+A --> P: 200 { connectionId, connectionToken,\n  availableTransports: [WebSockets, SSE, LongPolling] }
+P --> B: 200 (same body)
+
+== 2. WebSocket handshake ==
+
+B -> I: GET /api/hubs/notifications?id=<connectionToken>\nUpgrade: websocket, Connection: Upgrade\nCookie: _oauth2_proxy=...
+note right of B
+  The browser cannot set an Authorization
+  header on a WebSocket handshake - but it
+  does not need to. It sends the cookie
+  automatically (same-origin), and the proxy
+  supplies the bearer token upstream.
+  No ?access_token= query string, and no
+  OnMessageReceived event handler.
+end note
+I -> P: Forward (upgrade headers preserved)
+P -> P: Decrypt cookie, load session
+P -> A: GET .../hubs/notifications (upgrade)\nAuthorization: Bearer <okta-id-token>
+A -> A: JwtBearer validates the token;\nHubCallerContext.User populated,\nContext.UserIdentifier = "sub"
+A --> P: 101 Switching Protocols
+P --> B: 101 Switching Protocols
+A -> A: NotificationsHub.OnConnectedAsync()\nGroups.AddToGroupAsync(ConnectionId, tenantId)
+
+== 3. Live connection ==
+
+B -> A: invoke("Subscribe", topic) over the open socket
+A --> B: Clients.Caller / Clients.User(userId) / Clients.Group(...)
+note over B, A
+  Once upgraded, frames flow through the proxy without
+  re-authentication - the cookie and the bearer token are
+  checked at handshake time only.
+end note
+
+== 4. Expiry and reconnect ==
+
+A -> A: Bearer token exp reached
+note right of A
+  MapHub(..., o => o.CloseOnAuthenticationExpiration = true)
+  makes SignalR close the connection instead of letting an
+  authenticated socket outlive its token.
+end note
+A --> B: Close frame (authentication expired)
+B -> I: Automatic reconnect: POST .../negotiate\nCookie: _oauth2_proxy=...
+I -> P: Forward
+alt Session cookie still valid (--cookie-refresh keeps it fresh)
+    P -> O: Refresh token grant (if the ID token expired)
+    O --> P: New ID token
+    P -> A: POST .../negotiate\nAuthorization: Bearer <new-id-token>
+    A --> B: 200 -> handshake repeats, connection restored
+else Session expired
+    P --> B: 302 Location: https://{okta-domain}/oauth2/default/v1/authorize?...
+    note right of B
+      XHR/WebSocket cannot complete an interactive
+      redirect. The SignalR client surfaces a failed
+      reconnect; the SPA should reload the page so the
+      browser follows the redirect and signs in again.
+    end note
+end
+
+@enduml
