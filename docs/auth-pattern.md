@@ -31,16 +31,9 @@ The defining properties of the pattern:
 
 ## Architecture
 
-```mermaid
-flowchart LR
-    B[Browser<br/>Angular SPA] -- "session cookie only" --> I[Ingress]
-    subgraph K8s [Kubernetes cluster]
-        I --> P[oauth2-proxy<br/>Deployment/Service]
-        P -- "static assets" --> S[Angular assets<br/>nginx Deployment/Service<br/>incl. /assets/whoami.txt]
-        P -- "Authorization: Bearer &lt;id-token&gt;" --> A[ASP.NET Core API<br/>Deployment/Service]
-    end
-    P <-. "OIDC authorization-code flow" .-> O[(Okta)]
-```
+![Architecture](./architecture.png)
+
+*Source: [`architecture.puml`](./architecture.puml)*
 
 Everything the browser talks to enters through the Ingress, which routes all traffic
 for the host to the oauth2-proxy Service. oauth2-proxy runs in its standard
